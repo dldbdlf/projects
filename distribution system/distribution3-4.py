@@ -16,8 +16,14 @@ class SinkholeCalcNode:
     Node:
       - Subscribes to YOLO result JSON (/camera_infer_pub_cpu_id/inference_result)
       - Subscribes to camera image (/usb_cam/image_raw)
-      - When a sinkhole bbox is present, calculates darkest-in-ROI vs darkest-outside luma difference
-      - Publishes the luma_diff to /sinkhole/brightness_diff (Float32)
+      - When a sinkhole bbox is present, calculates:
+         1) darkest-in-ROI vs darkest-outside luma difference
+         2) bbox area (w*h)
+      - Publishes luma_diff to /sinkhole/brightness_diff (Float32)
+      - Publishes area to /sinkhole/size (Float32)
+
+    NOTE:
+      distribution1.py에서 퍼블리시하는 bbox_xywh = [x_min, y_min, w, h] 형식으로 맞춤
     """
 
     def __init__(self):
@@ -39,8 +45,9 @@ class SinkholeCalcNode:
         rospy.Subscriber(self.infer_topic, String, self.infer_cb,  queue_size=10)
         rospy.Subscriber(self.image_topic, Image, self.image_cb,   queue_size=1)
 
-        # ========= publisher =========
+        # ========= publishers =========
         self.pub_diff = rospy.Publisher("/sinkhole/brightness_diff", Float32, queue_size=10)
+        self.pub_size = rospy.Publisher("/sinkhole/size", Float32, queue_size=10)
 
         rospy.loginfo(("[INIT] sinkhole_calc_node ready\n"
                        f"       infer_topic={self.infer_topic}\n"
@@ -72,14 +79,17 @@ class SinkholeCalcNode:
                 rospy.logwarn("[DETECT] invalid bbox_xywh: %s", str(bbox))
                 return
 
-            cx, cy, w, h = bbox
+            # === distribution1.py 형식: [x_min, y_min, w, h] ===
+            x_min, y_min, w, h = bbox
             area = float(abs(w) * abs(h))
-            rospy.loginfo("[DETECT] bbox (w=%.1f, h=%.1f) -> area=%.1f", w, h, area)
+            rospy.loginfo("[DETECT] bbox (x_min=%.1f, y_min=%.1f, w=%.1f, h=%.1f) -> area=%.1f",
+                          x_min, y_min, w, h, area)
 
             with self.lock:
                 self.last_det = {
                     "time": rospy.Time.now().to_sec(),
-                    "bbox_xywh": [cx, cy, w, h]
+                    "bbox_xywh": [x_min, y_min, w, h],
+                    "area": area
                 }
 
         except Exception as e:
@@ -113,11 +123,12 @@ class SinkholeCalcNode:
             cv_rgb = cv_bgr[..., ::-1]
             H, W, _ = cv_rgb.shape
 
-            cx, cy, bw, bh = ld["bbox_xywh"]
-            x0 = max(0, int(round(cx - bw/2)))
-            x1 = min(W, int(round(cx + bw/2)))
-            y0 = max(0, int(round(cy - bh/2)))
-            y1 = min(H, int(round(cy + bh/2)))
+            # === distribution1.py 형식 해석 ===
+            x_min, y_min, bw, bh = ld["bbox_xywh"]
+            x0 = max(0, int(round(x_min)))
+            y0 = max(0, int(round(y_min)))
+            x1 = min(W, int(round(x_min + bw)))
+            y1 = min(H, int(round(y_min + bh)))
 
             if x1 <= x0 or y1 <= y0:
                 with self.lock:
@@ -150,9 +161,14 @@ class SinkholeCalcNode:
             luma_out = float(0.2126*darkest_out_rgb[0] + 0.7152*darkest_out_rgb[1] + 0.0722*darkest_out_rgb[2])
             luma_diff = float(luma_in - luma_out)
 
-            # publish
+            # publish brightness diff
             self.pub_diff.publish(Float32(data=luma_diff))
             rospy.loginfo("[BRIGHTNESS] Published luma_diff=%.2f", luma_diff)
+
+            # publish bbox area
+            if "area" in ld:
+                self.pub_size.publish(Float32(data=float(ld["area"])))
+                rospy.loginfo("[SIZE] Published area=%.1f", ld["area"])
 
             with self.lock:
                 self.last_det = None
@@ -168,4 +184,3 @@ if __name__ == "__main__":
         SinkholeCalcNode()
     except rospy.ROSInterruptException:
         pass
-
